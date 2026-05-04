@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import pandas as pd
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
@@ -104,21 +105,24 @@ def extract_features(batch_size=32, num_workers=4):
         pin_memory=True if torch.cuda.is_available() else False
     )
 
-    all_features = []
-    all_labels = []
-    all_paths = []
+    data = []
 
     print(f"Extracting features on {device}...")
     with torch.no_grad():
-        for imgs, labels, paths in tqdm(datloader, desc="Processing Batches"):
+        for imgs, labels, paths in tqdm(datloader, desc="Processing batches"):
             if imgs.numel() == 0:
                 continue
             
             imgs = imgs.to(device)
-            feats=model(imgs)
-            all_features.append(feats.cpu().numpy())
-            all_labels.extend(labels)
-            all_paths.extend(paths)
+            feats = model(imgs)
+            feats_np = feats.cpu().numpy()
 
-    final_features = np.vstack(all_features) if all_features else np.array([])
-    return final_features, all_labels, all_paths
+            for path, label, feat in zip(paths, labels, feats_np):
+                record = {
+                    'filename': path,
+                    'label': label,
+                    'features': feat
+                }
+                data.append(record)
+    df = pd.DataFrame(data)
+    return df

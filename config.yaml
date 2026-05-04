@@ -5,6 +5,6 @@ features_extractor:
   backbone: "wide_resnet50_2"
   weights: "DEFAULT"
   folder_map:
-    'D:/emanuele/Code/eda_dataset/data/good': "Dust"
-    'D:/emanuele/Code/eda_dataset/data/reject': "Paglia"
+    'D:/emanuele/Code/eda_dataset/data/good': "Good"
+    'D:/emanuele/Code/eda_dataset/data/reject': "Reject"
 
