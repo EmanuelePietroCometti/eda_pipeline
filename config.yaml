@@ -1,0 +1,10 @@
+general_configruation:
+  img_size: [256, 256]
+  valid_extensions: [".bmp", ".BMP"]
+features_extractor:
+  backbone: "wide_resnet50_2"
+  weights: "DEFAULT"
+  folder_map:
+    'D:/emanuele/Code/eda_dataset/data/good': "Dust"
+    'D:/emanuele/Code/eda_dataset/data/reject': "Paglia"
+
