@@ -53,7 +53,9 @@ def main():
         title="TSNE 2D"
     )
 
-    tsne_pipeline_3d = build_tsne_pipeline(n_components=3, pre_pca_dims=n_95)
+    n_samples = X_features.shape[0]
+    perplexity = min(50.0, max(5.0, n_samples / 3.0))
+    tsne_pipeline_3d = build_tsne_pipeline(n_components=3, pre_pca_dims=n_95, perplexity=perplexity, early_exaggeration=15.0, n_iter=1500)
     X_tsne_3d = tsne_pipeline_3d.fit_transform(X_features)
 
     data['tsne_x_3d'] = X_tsne_3d[:, 0]

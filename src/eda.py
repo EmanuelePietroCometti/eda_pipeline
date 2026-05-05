@@ -13,14 +13,14 @@ def build_pca_pipeline(n_components=2, random_state=42):
         ("pca", PCA(n_components=n_components, random_state=random_state))
     ])
 
-def build_tsne_pipeline(n_components=2, pre_pca_dims=50, random_state=42):
+def build_tsne_pipeline(n_components=2, pre_pca_dims=50, random_state=42, perplexity=30.0, early_exaggeration=12.0, n_iter=1000):
     """
     Function that build a tsne pipeline with the scikit-learn library 
     """
     return Pipeline([
         ("scaler", StandardScaler()),
         ("pre_pca", PCA(n_components=pre_pca_dims, random_state=random_state)),
-        ("tsne", TSNE(n_components=n_components, random_state=random_state, init="pca", learning_rate="auto"))
+        ("tsne", TSNE(n_components=n_components, random_state=random_state, init="pca", learning_rate="auto", max_iter=n_iter, perplexity=perplexity, early_exaggeration=early_exaggeration))
     ])
 
 def build_umap_pipeline(n_components=2, random_state=42):
