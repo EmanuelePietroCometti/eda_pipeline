@@ -1,4 +1,4 @@
-general_configruation:
+general_configuration:
   img_size: [256, 256]
   valid_extensions: [".bmp", ".BMP"]
 features_extractor:
