@@ -1,10 +1,19 @@
 general_configuration:
-  img_size: [256, 256]
-  valid_extensions: [".bmp", ".BMP"]
-features_extractor:
-  backbone: "wide_resnet50_2"
-  weights: "DEFAULT"
-  folder_map:
-    'D:/emanuele/Code/eda_dataset/data/good': "Good"
-    'D:/emanuele/Code/eda_dataset/data/reject': "Reject"
+  # Root of the dataset. Expected layout:
+  #   dataset_root/good/{good,dust}/...
+  #   dataset_root/reject/{macchie,paglie,nodi,rotture}/...
+  dataset_root: "dataset"
+  patch_size: 512
+  valid_extensions: [".bmp", ".BMP", ".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+  output_dir: "outputs"
+  random_state: 42
 
+feature_extraction:
+  glcm:
+    distances: [1, 2]                 # pixel offsets probed by the co-occurrence matrix
+    angles_deg: [0, 45, 90, 135]      # averaged over -> rotation-robust descriptors
+    levels: 64                        # grey-level quantisation (denser, less noisy GLCM)
+  lbp:
+    radius: 3
+    n_points: 24                      # sampling points on the circle (typically 8 * radius)
+    method: "uniform"                 # rotation-invariant uniform patterns -> n_points + 2 bins
