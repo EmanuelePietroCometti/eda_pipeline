@@ -10,12 +10,17 @@ single tidy :class:`pandas.DataFrame`:
 
 A. **Chromatic features** (HSV + CIE-Lab colour spaces): per-channel mean,
    variance, skewness and kurtosis. These isolate colour alterations such as the
-   *macchie* (stains) on light fabrics.
+   *macchie* (stains) on light fabrics. The HSV hue channel is excluded: hue is
+   an angle (179 and 0 are neighbours) and is mostly noise at the low saturation
+   of black and white fabrics, so linear moments on it are not meaningful.
 B. **Structural / texture features**:
    * **GLCM** (Gray-Level Co-occurrence Matrix) -> Contrast, Homogeneity,
      Energy, Correlation. Captures the periodic warp/weft pattern of the weave.
-   * **LBP** (Local Binary Patterns) -> normalised histogram + local variance,
-     quantifying the micro-texture.
+   * **LBP** (Local Binary Patterns) -> normalised histogram + dispersion of the
+     LBP codes, quantifying the micro-texture.
+
+All descriptors are computed on the WHOLE patch: a defect covering a few dozen
+pixels only shifts them slightly. This is a known limitation of the analysis.
 
 Only ``scikit-image``, ``cv2``, ``numpy`` and ``pandas`` are used, as required.
 Paths are handled exclusively through :mod:`pathlib`.
@@ -24,7 +29,7 @@ Paths are handled exclusively through :mod:`pathlib`.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -39,21 +44,21 @@ from tqdm import tqdm
 # The dataset is expected to be laid out as:
 #
 #   dataset_root/
-#     good/
-#       good/     -> nominal fabric                       (label "Good")
-#       dust/     -> nominal fabric with ambient dust     (label "Dust")
-#     reject/
-#       macchie/  -> chromatic alterations                (label "Macchie")
-#       paglie/   -> foreign structural inclusions        (label "Paglie")
-#       nodi/     -> yarn knots / slubs                   (label "Nodi")
-#       rotture/  -> weave tears                           (label "Rotture")
+#     <fabric>/                 e.g. nero, chiaro, quadrettoni
+#       good/
+#         good/     -> nominal fabric                       (label "Good")
+#         dust/     -> nominal fabric with ambient dust     (label "Dust")
+#       reject/
+#         <class>/  -> one folder per defect class
 #
-# The "good" branch is deliberately split into two sub-folders so that dusty
-# (but still nominal) samples can be analysed separately from the pristine ones.
+# The fabric is the FIRST path component below ``dataset_root``; the class is
+# the name of the folder that directly contains the image, mapped to a label via
+# ``classes.folder_to_label`` in ``config.yaml``. A legacy layout without the
+# fabric level (dataset_root/good/..., dataset_root/reject/...) is still
+# accepted: every image is then assigned to ``default_fabric``.
 
-# Mapping between the on-disk sub-folder name and the canonical class label used
-# throughout the pipeline. Keys are lower-cased folder names.
-_SUBFOLDER_TO_LABEL: Dict[str, str] = {
+# Fallback mapping, used only if the config does not provide one.
+DEFAULT_FOLDER_TO_LABEL: Dict[str, str] = {
     "good": "Good",
     "dust": "Dust",
     "macchie": "Macchie",
@@ -61,51 +66,77 @@ _SUBFOLDER_TO_LABEL: Dict[str, str] = {
     "nodi": "Nodi",
     "rotture": "Rotture",
 }
+DEFAULT_NOMINAL_LABELS = ("Good", "Dust")
 
-# Coarse grouping (nominal vs defective) derived from the fine label.
-_NOMINAL_LABELS = {"Good", "Dust"}
+# Top-level folder names that identify the legacy (fabric-less) layout.
+_LEGACY_TOP_LEVEL = {"good", "reject"}
 
 
 def discover_images(
     dataset_root: Path,
     valid_extensions: Tuple[str, ...],
+    folder_to_label: Dict[str, str] | None = None,
+    nominal_labels: Sequence[str] = DEFAULT_NOMINAL_LABELS,
+    default_fabric: str = "unico",
 ) -> pd.DataFrame:
-    """Walk ``dataset_root`` and build an index of ``(path, label, group)``.
+    """Walk ``dataset_root`` and build an index of ``(path, fabric, label, group)``.
 
     Parameters
     ----------
     dataset_root : pathlib.Path
-        Root directory following the ``good/{good,dust}`` and
-        ``reject/{macchie,paglie,nodi,rotture}`` layout.
+        Root directory following the ``<fabric>/good/{good,dust}`` and
+        ``<fabric>/reject/<class>`` layout.
     valid_extensions : tuple of str
         Accepted file suffixes (compared case-insensitively, e.g. ``".bmp"``).
+    folder_to_label : dict, optional
+        Lower-case folder name -> class label. Several folders may share a label.
+    nominal_labels : sequence of str
+        Labels considered nominal (``group == "Good"``); all others are
+        ``"Reject"``.
+    default_fabric : str
+        Fabric assigned to every image when the layout has no fabric level.
 
     Returns
     -------
     pandas.DataFrame
-        Columns: ``filename`` (str), ``label`` (fine class),
+        Columns: ``filename``, ``fabric``, ``label`` (fine class),
         ``group`` (``"Good"``/``"Reject"``).
     """
     dataset_root = Path(dataset_root)
     exts = {e.lower() for e in valid_extensions}
-    records: List[dict] = []
+    mapping = {k.lower(): v for k, v in (folder_to_label or DEFAULT_FOLDER_TO_LABEL).items()}
+    nominal = set(nominal_labels)
 
-    # ``rglob("*")`` traverses the whole tree; the parent folder name determines
-    # the label, which makes the discovery robust to an extra nesting level.
-    for file_path in dataset_root.rglob("*"):
+    records: List[dict] = []
+    unknown: Dict[str, int] = {}
+
+    # ``rglob("*")`` traverses the whole tree; sorting makes the order (and so
+    # every downstream result) independent of the file system.
+    for file_path in sorted(dataset_root.rglob("*")):
         if not file_path.is_file() or file_path.suffix.lower() not in exts:
             continue
 
         folder_name = file_path.parent.name.lower()
-        label = _SUBFOLDER_TO_LABEL.get(folder_name)
+        label = mapping.get(folder_name)
+        rel_parts = file_path.relative_to(dataset_root).parts
         if label is None:
-            # Image sitting in an unrecognised folder: skip but warn once.
+            key = "/".join(rel_parts[:-1])
+            unknown[key] = unknown.get(key, 0) + 1
             continue
 
-        group = "Good" if label in _NOMINAL_LABELS else "Reject"
+        top = rel_parts[0]
+        fabric = default_fabric if top.lower() in _LEGACY_TOP_LEVEL else top
+
+        group = "Good" if label in nominal else "Reject"
         records.append(
-            {"filename": str(file_path), "label": label, "group": group}
+            {"filename": str(file_path), "fabric": fabric,
+             "label": label, "group": group}
         )
+
+    # Skipped folders are reported explicitly, never silently ignored.
+    for folder, n in sorted(unknown.items()):
+        print(f"Warning: {n} image(s) in '{folder}' skipped "
+              f"(folder not listed in classes.folder_to_label).")
 
     if not records:
         raise FileNotFoundError(
@@ -184,12 +215,16 @@ def _moment_stats(channel: np.ndarray, prefix: str) -> Dict[str, float]:
 
 
 def extract_color_features(rgb: np.ndarray) -> Dict[str, float]:
-    """Extract per-channel moments in the HSV and CIE-Lab colour spaces.
+    """Extract per-channel moments in the HSV (S, V) and CIE-Lab colour spaces.
 
-    HSV decouples chromaticity (H, S) from luminance (V); Lab is
-    perceptually-uniform with an explicit luminance (L) and two opponent-colour
-    axes (a: green-red, b: blue-yellow). Together they give a rich, largely
-    redundant-free description of colour anomalies.
+    HSV separates saturation (S) from brightness (V); Lab is perceptually
+    uniform with an explicit luminance (L) and two opponent-colour axes
+    (a: green-red, b: blue-yellow).
+
+    The hue channel (H) is deliberately excluded. Hue is an angle, so linear
+    moments are wrong near the wrap-around (179 and 0 are neighbours), and on
+    black or white fabrics the saturation is so low that hue is dominated by
+    sensor noise. Keeping it would inject noise into PCA and t-SNE.
 
     Note on ranges (OpenCV, 8-bit): H in [0, 179], S/V in [0, 255];
     L/a/b in [0, 255]. Absolute scale is irrelevant downstream because features
@@ -199,7 +234,7 @@ def extract_color_features(rgb: np.ndarray) -> Dict[str, float]:
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
 
     feats: Dict[str, float] = {}
-    for idx, name in enumerate(("h", "s", "v")):
+    for idx, name in ((1, "s"), (2, "v")):  # H (index 0) excluded, see above
         feats.update(_moment_stats(hsv[:, :, idx], f"hsv_{name}"))
     for idx, name in enumerate(("l", "a", "b")):
         feats.update(_moment_stats(lab[:, :, idx], f"lab_{name}"))
@@ -262,7 +297,7 @@ def extract_lbp_features(
     radius: int = 3,
     method: str = "uniform",
 ) -> Dict[str, float]:
-    """Compute the Local Binary Pattern histogram and local variance.
+    """Compute the Local Binary Pattern histogram and the dispersion of the codes.
 
     For every pixel, LBP thresholds the ``n_points`` neighbours sampled on a
     circle of the given ``radius`` against the centre and encodes the result as a
@@ -274,8 +309,11 @@ def extract_lbp_features(
 
     * the **normalised histogram** (a probability distribution over the LBP
       codes) — this is the primary micro-texture signature;
-    * the **variance of the LBP-coded image** (``lbp_var``), a compact scalar
-      summarising the spread of local patterns.
+    * the **dispersion of the LBP codes** (``lbp_code_dispersion``), i.e. the
+      variance of the LBP-coded image: a compact scalar summarising how spread
+      the local patterns are. NOTE: this is NOT the rotation-invariant local
+      variance operator VAR of Ojala et al. (2002), which measures local
+      contrast; it carries largely the same information as the histogram.
 
     Foreign inclusions (*paglie*) and knots (*nodi*) perturb the regular weave
     and therefore shift mass across the LBP bins.
@@ -290,7 +328,7 @@ def extract_lbp_features(
     feats: Dict[str, float] = {
         f"lbp_hist_{i:02d}": float(hist[i]) for i in range(n_bins)
     }
-    feats["lbp_var"] = float(np.var(lbp))
+    feats["lbp_code_dispersion"] = float(np.var(lbp))
     return feats
 
 
@@ -334,13 +372,14 @@ def extract_features(config: dict) -> pd.DataFrame:
     config : dict
         Parsed ``config.yaml``. Relevant keys:
         ``general_configuration.dataset_root``, ``.patch_size``,
-        ``.valid_extensions`` and the ``feature_extraction.{glcm,lbp}`` blocks.
+        ``.valid_extensions``, ``.default_fabric``, the ``classes`` block and
+        the ``feature_extraction.{glcm,lbp}`` blocks.
 
     Returns
     -------
     pandas.DataFrame
-        One row per image: metadata columns (``filename``, ``label``,
-        ``group``) followed by all numeric feature columns.
+        One row per image: metadata columns (``filename``, ``fabric``,
+        ``label``, ``group``) followed by all numeric feature columns.
     """
     gen = config.get("general_configuration", {})
     fx = config.get("feature_extraction", {})
@@ -350,12 +389,19 @@ def extract_features(config: dict) -> pd.DataFrame:
     valid_extensions = tuple(gen.get("valid_extensions", [".bmp", ".BMP"]))
     glcm_cfg = fx.get("glcm", {})
     lbp_cfg = fx.get("lbp", {})
+    cls_cfg = config.get("classes", {})
 
-    index = discover_images(dataset_root, valid_extensions)
+    index = discover_images(
+        dataset_root,
+        valid_extensions,
+        folder_to_label=cls_cfg.get("folder_to_label"),
+        nominal_labels=cls_cfg.get("nominal", DEFAULT_NOMINAL_LABELS),
+        default_fabric=gen.get("default_fabric", "unico"),
+    )
     print(
         f"Discovered {len(index)} images across "
-        f"{index['label'].nunique()} classes: "
-        f"{index['label'].value_counts().to_dict()}"
+        f"{index['fabric'].nunique()} fabric(s) and "
+        f"{index['label'].nunique()} classes."
     )
 
     rows: List[dict] = []
@@ -374,6 +420,7 @@ def extract_features(config: dict) -> pd.DataFrame:
         rows.append(
             {
                 "filename": row.filename,
+                "fabric": row.fabric,
                 "label": row.label,
                 "group": row.group,
                 **feats,
@@ -381,6 +428,7 @@ def extract_features(config: dict) -> pd.DataFrame:
         )
 
     df = pd.DataFrame(rows)
+    n_meta = 4  # filename, fabric, label, group
     print(f"Feature matrix: {df.shape[0]} samples x "
-          f"{df.shape[1] - 3} numeric features.")
+          f"{df.shape[1] - n_meta} numeric features.")
     return df

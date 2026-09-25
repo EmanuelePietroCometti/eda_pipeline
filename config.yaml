@@ -1,12 +1,38 @@
 general_configuration:
-  # Root of the dataset. Expected layout:
-  #   dataset_root/good/{good,dust}/...
-  #   dataset_root/reject/{macchie,paglie,nodi,rotture}/...
+  # Root of the dataset. Expected layout (one sub-folder per fabric):
+  #   dataset_root/<fabric>/good/{good,dust}/...
+  #   dataset_root/<fabric>/reject/<defect_class>/...
+  # e.g. dataset_root/nero/..., dataset_root/chiaro/..., dataset_root/quadrettoni/...
   dataset_root: "dataset"
   patch_size: 512
   valid_extensions: [".bmp", ".BMP", ".png", ".jpg", ".jpeg", ".tif", ".tiff"]
   output_dir: "outputs"
   random_state: 42
+  # Used only if the dataset has no fabric level (legacy layout good/ reject/).
+  default_fabric: "unico"
+  # Optional left-to-right order of the fabrics in every figure.
+  # Fabrics not listed here are appended alphabetically.
+  fabric_order: ["nero", "chiaro", "quadrettoni"]
+
+classes:
+  # Folder name (lower-case) -> class label used in tables and figures.
+  # Several folders may map to the same label to aggregate sub-classes,
+  # e.g.  grappola: "Nodi".  Folders not listed here are skipped with a warning.
+  folder_to_label:
+    good: "Good"
+    dust: "Dust"
+    paglia: "Paglia"
+    nodo: "Nodo"
+    grappola: "Grappola"
+    macchia: "Macchia"
+  order: ["Good", "Dust", "Macchia", "Paglia", "Nodo", "Grappola"]
+  # Labels that are nominal (no real defect).
+  nominal: ["Good", "Dust"]
+  # Reference class for section 4.2 (fabric comparison uses ONLY this class).
+  good_label: "Good"
+  dust_label: "Dust"
+  # Defect class shown next to the dust in section 4.4.
+  dust_reference_defect: "Paglia"
 
 feature_extraction:
   glcm:
@@ -17,3 +43,30 @@ feature_extraction:
     radius: 3
     n_points: 24                      # sampling points on the circle (typically 8 * radius)
     method: "uniform"                 # rotation-invariant uniform patterns -> n_points + 2 bins
+
+analysis:
+  pca:
+    # Components fitted for the scree plot (capped by n_samples-1 and n_features).
+    n_components: 10
+    # 2D scatter plots to draw (1-based component indices).
+    plot_pairs: [[1, 2], [1, 3]]
+    # Features listed in the loadings figure for each component.
+    loadings_top_k: 8
+    # Components whose loadings are plotted and exported.
+    loadings_components: [1, 2, 3]
+  tsne:
+    # Main embedding shown in the chapter.
+    perplexity: 30
+    seed: 42
+    pre_pca_dims: 30
+    # Stability check (appendix): every combination is recomputed.
+    # Only structures visible in ALL panels should be described in the text.
+    stability_perplexities: [15, 30, 50]
+    stability_seeds: [0, 1, 2]
+  distributions:
+    # Features shown in the distribution plots of sections 4.2 and 4.4.
+    # Fix this list BEFORE looking at the results and do not change it afterwards.
+    features: ["hsv_s_var", "glcm_contrast", "glcm_energy", "lbp_code_dispersion"]
+    # Classes with fewer samples are drawn as individual points only (no violin),
+    # because a density estimate on a handful of samples is an artefact.
+    min_n_violin: 20

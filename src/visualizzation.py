@@ -4,15 +4,22 @@ visualizzation.py
 
 Publication-ready figures for the textile EDA (thesis-grade PNGs at 300 DPI).
 
-All plots share a consistent class ordering and colour palette so that the same
-class is always drawn in the same colour across every figure. Three families of
-plots are provided:
+Every figure reports the number of samples of each group, so that a class with
+a handful of samples (e.g. the dust) is never visually confused with a well
+populated one. Colours are fixed per class and per fabric across all figures,
+and every group also has its own marker, so figures remain readable in black
+and white and for colour-blind readers.
 
-* :func:`plot_multivariate_violins` — class-wise violin plots for a set of
-  metrics (e.g. HSV saturation variance, GLCM contrast).
-* :func:`plot_tsne_scatter` — the 2D t-SNE embedding coloured by class.
-* :func:`plot_overlap_density` — overlapping density curves of a GLCM metric for
-  two ambiguous classes (e.g. dusty *Good* vs *Paglie*).
+Figures provided:
+
+* :func:`plot_scree` — explained variance per PCA component and cumulative.
+* :func:`plot_pca_scatter` — 2D scatter of two PCA components.
+* :func:`plot_tsne_scatter` — 2D t-SNE embedding.
+* :func:`plot_tsne_grid` — t-SNE stability grid (perplexity x seed).
+* :func:`plot_loadings` — features with the largest loadings per component.
+* :func:`plot_family_share` — share of each component due to colour/GLCM/LBP.
+* :func:`plot_feature_distributions` — violins for well populated groups,
+  individual points for every group.
 
 Only ``seaborn`` and ``matplotlib`` are used for rendering.
 """
@@ -20,36 +27,55 @@ Only ``seaborn`` and ``matplotlib`` are used for rendering.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Mapping, Sequence, Tuple
 
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import seaborn as sns
-
-# Canonical left-to-right class ordering used on every categorical axis.
-CLASS_ORDER: List[str] = ["Good", "Dust", "Macchie", "Paglie", "Nodi", "Rotture"]
-
-# Fixed class -> colour mapping (colour-blind friendly qualitative palette).
-_PALETTE_COLORS = sns.color_palette("colorblind", len(CLASS_ORDER))
-CLASS_PALETTE: Dict[str, tuple] = dict(zip(CLASS_ORDER, _PALETTE_COLORS))
+from matplotlib.lines import Line2D
 
 # Human-readable axis labels for the internal feature column names.
 PRETTY_LABELS: Dict[str, str] = {
+    "hsv_s_mean": "HSV Saturation mean",
     "hsv_s_var": "HSV Saturation variance",
-    "hsv_h_var": "HSV Hue variance",
     "hsv_v_mean": "HSV Value (brightness) mean",
+    "hsv_v_var": "HSV Value (brightness) variance",
+    "lab_l_mean": "Lab L* mean (lightness)",
     "lab_a_mean": "Lab a* mean (green-red)",
     "lab_b_mean": "Lab b* mean (blue-yellow)",
     "glcm_contrast": "GLCM Contrast",
     "glcm_homogeneity": "GLCM Homogeneity",
     "glcm_energy": "GLCM Energy",
     "glcm_correlation": "GLCM Correlation",
-    "lbp_var": "LBP variance",
+    "lbp_code_dispersion": "LBP code dispersion",
 }
+
+_CB = sns.color_palette("colorblind", 8)
+FAMILY_PALETTE: Dict[str, tuple] = {"colour": _CB[0], "glcm": _CB[1], "lbp": _CB[2], "other": _CB[7]}
+FAMILY_HATCH: Dict[str, str] = {"colour": "", "glcm": "//", "lbp": "..", "other": "xx"}
+FAMILY_NAME: Dict[str, str] = {"colour": "Colore (HSV/Lab)", "glcm": "GLCM", "lbp": "LBP", "other": "Altro"}
+
+_MARKERS: Tuple[str, ...] = ("o", "s", "^", "D", "v", "P", "X", "*", "<", ">")
+_OTHER_COLOUR = (0.78, 0.78, 0.78)
+
+
+_PREFIX = {"hsv": "HSV", "lab": "Lab", "glcm": "GLCM", "lbp": "LBP"}
+_STAT = {"mean": "mean", "var": "variance", "skew": "skewness", "kurt": "kurtosis"}
 
 
 def _nice(col: str) -> str:
     """Map an internal column name to a human-readable axis label."""
-    return PRETTY_LABELS.get(col, col.replace("_", " "))
+    if col in PRETTY_LABELS:
+        return PRETTY_LABELS[col]
+    parts = col.split("_")
+    if parts[0] == "lbp" and len(parts) == 3 and parts[1] == "hist":
+        return f"LBP bin {parts[2]}"
+    if parts[0] in ("hsv", "lab") and len(parts) == 3:
+        channel = ({"l": "L*", "a": "a*", "b": "b*"}[parts[1]] if parts[0] == "lab"
+                   else parts[1].upper())
+        return f"{_PREFIX[parts[0]]} {channel} {_STAT.get(parts[2], parts[2])}"
+    return " ".join(_PREFIX.get(p, p) for p in parts)
 
 
 def set_publication_style() -> None:
@@ -61,185 +87,366 @@ def set_publication_style() -> None:
             "savefig.dpi": 300,      # high-resolution export for the thesis
             "savefig.bbox": "tight",
             "axes.titleweight": "bold",
+            "axes.spines.top": False,
+            "axes.spines.right": False,
             "pdf.fonttype": 42,      # editable text if exported to PDF/vector
         }
     )
 
 
-def _present_order(df, label_col: str) -> List[str]:
-    """Return CLASS_ORDER restricted to the classes actually present in ``df``."""
-    present = set(df[label_col].unique())
-    return [c for c in CLASS_ORDER if c in present]
-
-
 # --------------------------------------------------------------------------- #
-# 1. Multivariate violin plots
+# Styles shared by all figures
 # --------------------------------------------------------------------------- #
-def plot_multivariate_violins(
-    df,
-    metrics: Sequence[str],
-    out_dir: Path,
-    label_col: str = "label",
-    filename: str = "violin_multivariate.png",
-) -> Path:
-    """Draw one violin sub-plot per metric, classes on the x-axis.
+def make_style(levels: Sequence[str], palette: str = "colorblind") -> Tuple[Dict[str, tuple], Dict[str, str]]:
+    """Fixed colour and marker for every level, in the given order.
 
-    A violin plot overlays a mirrored kernel-density estimate on a box-plot,
-    exposing the full shape (modality, skew, spread) of each metric per class —
-    far more informative than a bare box-plot for the heavy-tailed texture and
-    colour distributions studied here.
+    Build it ONCE from the full list of classes (or fabrics) and reuse it in
+    every figure, so that the same group always has the same look.
     """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    order = _present_order(df, label_col)
+    if palette == "colorblind":
+        # Reordered so that consecutive classes never get similar hues: in the
+        # default order orange (Dust) and vermilion would fall on neighbouring
+        # classes, which is exactly the pair (Dust vs Paglie) we need to tell apart.
+        base = sns.color_palette("colorblind", 10)
+        colours = [base[i] for i in (0, 1, 2, 4, 5, 6, 9, 3, 8, 7)]
+    else:
+        colours = sns.color_palette(palette, max(len(levels), 3))
+    colour_map = {lvl: colours[i % len(colours)] for i, lvl in enumerate(levels)}
+    marker_map = {lvl: _MARKERS[i % len(_MARKERS)] for i, lvl in enumerate(levels)}
+    return colour_map, marker_map
 
-    n = len(metrics)
-    ncols = min(2, n)
-    nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(
-        nrows, ncols, figsize=(7 * ncols, 5 * nrows), squeeze=False
-    )
 
-    for ax, metric in zip(axes.ravel(), metrics):
-        sns.violinplot(
-            data=df, x=label_col, y=metric, order=order,
-            hue=label_col, palette=CLASS_PALETTE, legend=False,
-            cut=0, inner="box", density_norm="width", ax=ax,
+def _save(fig: plt.Figure, path: Path) -> Path:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)
+    return path
+
+
+def _scatter_groups(
+    ax: plt.Axes,
+    x: np.ndarray,
+    y: np.ndarray,
+    groups: pd.Series,
+    order: Sequence[str],
+    colours: Mapping[str, tuple],
+    markers: Mapping[str, str],
+    highlight: Sequence[str] | None = None,
+    emphasize: Sequence[str] = (),
+    point_size: float = 28.0,
+) -> List[Line2D]:
+    """Draw one scatter layer per group and return the legend handles.
+
+    * Groups are drawn from the most to the least populated, so small groups
+      are never hidden under large ones; ``emphasize`` groups are drawn last,
+      larger and with a black edge.
+    * With ``highlight``, only the listed groups are coloured: all others are
+      merged into a single light-grey "other classes" layer drawn first.
+    """
+    groups = pd.Series(np.asarray(groups), index=np.arange(len(groups)))
+    counts = groups.value_counts()
+    present = [g for g in order if g in counts.index]
+    handles: List[Line2D] = []
+
+    if highlight is not None:
+        others = [g for g in present if g not in highlight]
+        if others:
+            mask = groups.isin(others).to_numpy()
+            ax.scatter(x[mask], y[mask], s=point_size * 0.6, c=[_OTHER_COLOUR],
+                       marker="o", linewidths=0, alpha=0.6, zorder=1)
+            handles.append(Line2D([], [], linestyle="", marker="o", markersize=6,
+                                  markerfacecolor=_OTHER_COLOUR, markeredgewidth=0,
+                                  label=f"Altre classi (n={int(mask.sum())})"))
+        present = [g for g in present if g in highlight]
+
+    draw_order = sorted(present, key=lambda g: (g in emphasize, -counts[g]))
+    for rank, g in enumerate(draw_order):
+        mask = (groups == g).to_numpy()
+        big = g in emphasize
+        ax.scatter(
+            x[mask], y[mask],
+            s=point_size * (2.6 if big else 1.0),
+            c=[colours.get(g, _OTHER_COLOUR)],
+            marker=markers.get(g, "o"),
+            edgecolors="black", linewidths=0.9 if big else 0.25,
+            alpha=0.95 if big else 0.7,
+            zorder=3 + rank,
         )
-        ax.set_xlabel("")
-        ax.set_ylabel(_nice(metric))
-        ax.set_title(_nice(metric))
-        ax.tick_params(axis="x", rotation=20)
-
-    # Hide any unused axes in the grid.
-    for ax in axes.ravel()[n:]:
-        ax.set_visible(False)
-
-    fig.suptitle("Class-wise distribution of discriminative features", y=1.02)
-    fig.tight_layout()
-    path = out_dir / filename
-    fig.savefig(path)
-    plt.close(fig)
-    return path
+    # Legend in the canonical order, not in drawing order.
+    for g in present:
+        big = g in emphasize
+        handles.append(Line2D([], [], linestyle="", marker=markers.get(g, "o"),
+                              markersize=9 if big else 7,
+                              markerfacecolor=colours.get(g, _OTHER_COLOUR),
+                              markeredgecolor="black", markeredgewidth=0.9 if big else 0.25,
+                              label=f"{g} (n={int(counts[g])})"))
+    return handles
 
 
 # --------------------------------------------------------------------------- #
-# 2. t-SNE scatter
+# PCA figures
 # --------------------------------------------------------------------------- #
-def plot_tsne_scatter(
-    df,
-    out_dir: Path,
-    x_col: str = "tsne_1",
-    y_col: str = "tsne_2",
-    label_col: str = "label",
-    filename: str = "tsne_scatter.png",
-) -> Path:
-    """Scatter the 2D t-SNE embedding, coloured by class.
+def plot_scree(explained_variance_ratio: np.ndarray, path: Path, title: str) -> Path:
+    """Bar = variance explained by each component, line = cumulative variance."""
+    evr = np.asarray(explained_variance_ratio) * 100
+    comps = np.arange(1, len(evr) + 1)
 
-    This figure visualises how the broad ``Good`` manifold spreads across the
-    latent space and how structural defects and dust overlap with it — the core
-    qualitative evidence for the ambiguity discussed in the thesis.
-    """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    order = _present_order(df, label_col)
-
-    fig, ax = plt.subplots(figsize=(9, 8))
-    sns.scatterplot(
-        data=df, x=x_col, y=y_col,
-        hue=label_col, hue_order=order, palette=CLASS_PALETTE,
-        s=45, alpha=0.75, edgecolor="black", linewidth=0.3, ax=ax,
-    )
-    ax.set_xlabel("t-SNE dimension 1")
-    ax.set_ylabel("t-SNE dimension 2")
-    ax.set_title("t-SNE projection of handcrafted features")
-    ax.legend(title="Class", bbox_to_anchor=(1.02, 1), loc="upper left")
-
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(comps, evr, color=sns.color_palette("colorblind")[0], alpha=0.85,
+                  label="Varianza della componente")
+    for bar, v in zip(bars, evr):
+        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.8, f"{v:.1f}",
+                ha="center", va="bottom", fontsize=8)
+    ax.plot(comps, np.cumsum(evr), color="black", marker="o", linewidth=1.5,
+            label="Varianza cumulata")
+    ax.set_xticks(comps)
+    ax.set_xticklabels([f"PC{i}" for i in comps])
+    ax.set_ylim(0, 105)
+    ax.set_ylabel("Varianza spiegata (%)")
+    ax.set_title(title)
+    ax.legend(loc="center right", frameon=True)
     fig.tight_layout()
-    path = out_dir / filename
-    fig.savefig(path)
-    plt.close(fig)
-    return path
+    return _save(fig, path)
 
 
 def plot_pca_scatter(
-    df,
-    out_dir: Path,
-    label_col: str = "label",
-    filename: str = "pca_scatter.png",
+    scores: pd.DataFrame,
+    explained_variance_ratio: np.ndarray,
+    groups: pd.Series,
+    pcs: Tuple[int, int],
+    order: Sequence[str],
+    colours: Mapping[str, tuple],
+    markers: Mapping[str, str],
+    path: Path,
+    title: str,
+    legend_title: str,
+    highlight: Sequence[str] | None = None,
+    emphasize: Sequence[str] = (),
 ) -> Path:
-    """Scatter the 2D PCA projection, annotating explained variance if available."""
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    order = _present_order(df, label_col)
-
-    evr = df.attrs.get("pca_explained_variance_ratio_")
-    xlab = "PC 1" if evr is None else f"PC 1 ({evr[0] * 100:.1f}%)"
-    ylab = "PC 2" if evr is None else f"PC 2 ({evr[1] * 100:.1f}%)"
-
-    fig, ax = plt.subplots(figsize=(9, 8))
-    sns.scatterplot(
-        data=df, x="pca_1", y="pca_2",
-        hue=label_col, hue_order=order, palette=CLASS_PALETTE,
-        s=45, alpha=0.75, edgecolor="black", linewidth=0.3, ax=ax,
+    """Scatter of two PCA components (1-based indices in ``pcs``)."""
+    i, j = pcs
+    evr = np.asarray(explained_variance_ratio) * 100
+    fig, ax = plt.subplots(figsize=(8.5, 7))
+    handles = _scatter_groups(
+        ax, scores[f"PC{i}"].to_numpy(), scores[f"PC{j}"].to_numpy(),
+        groups, order, colours, markers, highlight=highlight, emphasize=emphasize,
     )
-    ax.set_xlabel(xlab)
-    ax.set_ylabel(ylab)
-    ax.set_title("PCA projection of handcrafted features")
-    ax.legend(title="Class", bbox_to_anchor=(1.02, 1), loc="upper left")
-
+    ax.axhline(0, color="grey", linewidth=0.6, zorder=0)
+    ax.axvline(0, color="grey", linewidth=0.6, zorder=0)
+    ax.set_xlabel(f"PC{i} ({evr[i - 1]:.1f}%)")
+    ax.set_ylabel(f"PC{j} ({evr[j - 1]:.1f}%)")
+    ax.set_title(title)
+    ax.legend(handles=handles, title=legend_title, bbox_to_anchor=(1.02, 1),
+              loc="upper left", frameon=True)
     fig.tight_layout()
-    path = out_dir / filename
-    fig.savefig(path)
-    plt.close(fig)
-    return path
+    return _save(fig, path)
 
 
-# --------------------------------------------------------------------------- #
-# 3. Overlapping density histograms
-# --------------------------------------------------------------------------- #
-def plot_overlap_density(
-    df,
-    metric: str,
-    class_a: str,
-    class_b: str,
-    out_dir: Path,
-    label_col: str = "label",
-    filename: str | None = None,
+def plot_loadings(
+    loadings: pd.DataFrame,
+    explained_variance_ratio: np.ndarray,
+    components: Sequence[str],
+    top_k: int,
+    path: Path,
+    title: str,
 ) -> Path:
-    """Overlay the density of ``metric`` for two classes to expose their ambiguity.
+    """Horizontal bars of the ``top_k`` largest |loadings| for each component.
 
-    Filled KDE curves (with a light histogram underlay) make the shared area
-    between, e.g., dusty *Good* and *Paglie* immediately visible — the visual
-    counterpart of the Bhattacharyya / overlap coefficients from :mod:`src.eda`.
+    Bars are coloured by feature family, so it is immediately visible whether a
+    component is driven by colour or by texture descriptors.
     """
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if filename is None:
-        filename = f"overlap_{metric}_{class_a}_vs_{class_b}.png"
+    from .eda import feature_family  # local import: avoid a circular import
 
-    subset = df[df[label_col].isin([class_a, class_b])]
-    palette = {c: CLASS_PALETTE.get(c) for c in (class_a, class_b)}
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    # Light histogram context...
-    sns.histplot(
-        data=subset, x=metric, hue=label_col, hue_order=[class_a, class_b],
-        palette=palette, stat="density", common_norm=False,
-        element="step", alpha=0.20, ax=ax, legend=False,
-    )
-    # ...with smooth, filled KDEs on top to highlight the overlap region.
-    sns.kdeplot(
-        data=subset, x=metric, hue=label_col, hue_order=[class_a, class_b],
-        palette=palette, fill=True, alpha=0.35, common_norm=False,
-        linewidth=2, ax=ax,
-    )
-    ax.set_xlabel(_nice(metric))
-    ax.set_ylabel("Density")
-    ax.set_title(f"Distribution overlap: {class_a} vs {class_b} — {_nice(metric)}")
-
+    comps = [c for c in components if c in loadings.columns]
+    evr = np.asarray(explained_variance_ratio) * 100
+    fig, axes = plt.subplots(1, len(comps), figsize=(5.2 * len(comps), 0.45 * top_k + 1.8),
+                             squeeze=False)
+    for ax, comp in zip(axes.ravel(), comps):
+        col = loadings[comp]
+        top = col.reindex(col.abs().sort_values(ascending=False).index[:top_k])[::-1]
+        fams = [feature_family(f) for f in top.index]
+        bars = ax.barh([_nice(f) for f in top.index], top.to_numpy(),
+                       color=[FAMILY_PALETTE[f] for f in fams], edgecolor="black", linewidth=0.4)
+        for bar, fam in zip(bars, fams):
+            bar.set_hatch(FAMILY_HATCH[fam])
+        ax.axvline(0, color="black", linewidth=0.8)
+        ax.set_xlim(-1, 1)
+        idx = int(comp[2:]) - 1
+        ax.set_title(f"{comp} ({evr[idx]:.1f}%)")
+        ax.set_xlabel("Loading")
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=FAMILY_PALETTE[f], edgecolor="black", hatch=FAMILY_HATCH[f],
+                     label=FAMILY_NAME[f]) for f in ("colour", "glcm", "lbp")]
+    fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False,
+               bbox_to_anchor=(0.5, -0.06))
+    fig.suptitle(title, y=1.02)
     fig.tight_layout()
-    path = out_dir / filename
-    fig.savefig(path)
-    plt.close(fig)
-    return path
+    return _save(fig, path)
+
+
+def plot_family_share(share: pd.DataFrame, path: Path, title: str) -> Path:
+    """100% stacked bars: fraction of each component due to each feature family."""
+    comps = list(dict.fromkeys(share["component"]))
+    families = [f for f in ("colour", "glcm", "lbp", "other") if f in set(share["family"])]
+
+    fig, ax = plt.subplots(figsize=(8, 0.7 * len(comps) + 1.8))
+    left = np.zeros(len(comps))
+    for fam in families:
+        vals = np.array([
+            share.loc[(share["component"] == c) & (share["family"] == fam), "share_pct"].sum()
+            for c in comps
+        ])
+        n_feat = int(share.loc[share["family"] == fam, "n_features"].iloc[0])
+        ax.barh(comps, vals, left=left, color=FAMILY_PALETTE[fam], hatch=FAMILY_HATCH[fam],
+                edgecolor="black", linewidth=0.4, label=f"{FAMILY_NAME[fam]} ({n_feat} feature)")
+        for y, (l, v) in enumerate(zip(left, vals)):
+            if v >= 6:
+                ax.text(l + v / 2, y, f"{v:.0f}%", ha="center", va="center", fontsize=9,
+                        bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                                  edgecolor="none", alpha=0.85))
+        left += vals
+    ax.invert_yaxis()
+    ax.set_xlim(0, 100)
+    ax.set_xlabel("Quota della componente (% dei loading al quadrato)")
+    ax.set_title(title)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=len(families), frameon=False)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+# --------------------------------------------------------------------------- #
+# t-SNE figures
+# --------------------------------------------------------------------------- #
+def plot_tsne_scatter(
+    embedding: np.ndarray,
+    groups: pd.Series,
+    order: Sequence[str],
+    colours: Mapping[str, tuple],
+    markers: Mapping[str, str],
+    path: Path,
+    title: str,
+    legend_title: str,
+    highlight: Sequence[str] | None = None,
+    emphasize: Sequence[str] = (),
+) -> Path:
+    """Scatter of a 2D t-SNE embedding.
+
+    Axes carry no unit: t-SNE coordinates, distances between clusters and
+    cluster sizes are not interpretable, so ticks are hidden on purpose.
+    """
+    fig, ax = plt.subplots(figsize=(8.5, 7))
+    handles = _scatter_groups(ax, embedding[:, 0], embedding[:, 1], groups, order,
+                              colours, markers, highlight=highlight, emphasize=emphasize)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+    ax.set_title(title)
+    ax.legend(handles=handles, title=legend_title, bbox_to_anchor=(1.02, 1),
+              loc="upper left", frameon=True)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+def plot_tsne_grid(
+    runs: Mapping[Tuple[float, int], np.ndarray],
+    groups: pd.Series,
+    order: Sequence[str],
+    colours: Mapping[str, tuple],
+    markers: Mapping[str, str],
+    path: Path,
+    title: str,
+    legend_title: str,
+    emphasize: Sequence[str] = (),
+) -> Path:
+    """Small multiples: one t-SNE per (perplexity, seed), rows = perplexity.
+
+    Runs use a random initialisation (see :func:`src.eda.tsne_stability`), so
+    panels are rotated/mirrored with respect to each other: compare which
+    groups stay together, not where they are.
+    """
+    perps = sorted({p for p, _ in runs})
+    seeds = sorted({s for _, s in runs})
+    fig, axes = plt.subplots(len(perps), len(seeds),
+                             figsize=(3.6 * len(seeds), 3.4 * len(perps)), squeeze=False)
+    handles: List[Line2D] = []
+    for r, perp in enumerate(perps):
+        for c, seed in enumerate(seeds):
+            ax = axes[r, c]
+            emb = runs[(perp, seed)]
+            handles = _scatter_groups(ax, emb[:, 0], emb[:, 1], groups, order, colours,
+                                      markers, emphasize=emphasize, point_size=10)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f"perplexity {perp:.3g} · seed {seed}", fontsize=10, fontweight="normal")
+    fig.legend(handles=handles, title=legend_title, loc="center left",
+               bbox_to_anchor=(1.0, 0.5), frameon=True)
+    fig.suptitle(title, y=1.01)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+# --------------------------------------------------------------------------- #
+# Feature distributions
+# --------------------------------------------------------------------------- #
+def plot_feature_distributions(
+    df: pd.DataFrame,
+    x_col: str,
+    features: Sequence[str],
+    order: Sequence[str],
+    colours: Mapping[str, tuple],
+    path: Path,
+    title: str,
+    min_n_violin: int = 20,
+) -> Path:
+    """One panel per feature, groups on the x-axis.
+
+    Groups with at least ``min_n_violin`` samples get a violin (density shape,
+    quartiles as dashed lines) plus their points; smaller groups are shown
+    ONLY as points, because a density estimated from a handful of samples is an
+    artefact of the kernel, not a property of the data. The sample size of
+    every group is written under its tick.
+    """
+    counts = df[x_col].value_counts()
+    order = [g for g in order if g in counts.index]
+    big = [g for g in order if counts[g] >= min_n_violin]
+    small = [g for g in order if counts[g] < min_n_violin]
+    features = [f for f in features if f in df.columns]
+    if not features:
+        raise ValueError("None of the requested distribution features is available.")
+
+    n = len(features)
+    ncols = min(2, n)
+    nrows = (n + ncols - 1) // ncols
+    panel_w = 1.6 * len(order) + 3.5
+    fig, axes = plt.subplots(nrows, ncols, figsize=(panel_w * ncols, 4.6 * nrows), squeeze=False)
+
+    for ax, feat in zip(axes.ravel(), features):
+        if big:
+            sub = df[df[x_col].isin(big)]
+            sns.violinplot(data=sub, x=x_col, y=feat, order=order, hue=x_col,
+                           hue_order=big, palette=colours, legend=False, cut=0,
+                           inner="quart", density_norm="width", linewidth=0.8,
+                           saturation=0.9, ax=ax)
+            for coll in ax.collections:
+                coll.set_alpha(0.45)
+            sns.stripplot(data=sub, x=x_col, y=feat, order=order, color="black",
+                          size=1.8, alpha=0.35, jitter=0.22, ax=ax)
+        if small:
+            sub = df[df[x_col].isin(small)]
+            sns.stripplot(data=sub, x=x_col, y=feat, order=order, hue=x_col,
+                          hue_order=small, palette=colours, legend=False, size=6,
+                          jitter=0.12, edgecolor="black", linewidth=0.8, ax=ax)
+        ax.set_xticks(range(len(order)))
+        ax.set_xticklabels([f"{g}\n(n={int(counts[g])})" for g in order])
+        ax.set_xlabel("")
+        ax.set_ylabel(_nice(feat))
+        ax.set_title(_nice(feat))
+
+    for ax in axes.ravel()[n:]:
+        ax.set_visible(False)
+
+    fig.suptitle(title, y=1.02)
+    fig.tight_layout()
+    return _save(fig, path)

@@ -2,36 +2,47 @@
 eda.py
 ======
 
-Statistical analysis and dimensionality reduction for the textile EDA.
+Descriptive analysis for the textile EDA: PCA and t-SNE only.
 
 Given the handcrafted feature :class:`~pandas.DataFrame` produced by
 :mod:`src.feature_extraction`, this module provides:
 
-* **Dimensionality reduction** — PCA (linear, variance-maximising) and t-SNE
-  (non-linear, neighbourhood-preserving) projections onto 2D.
-* **Distribution-overlap metrics** — Bhattacharyya coefficient/distance and the
-  Overlapping Coefficient (OVL) to quantify how much the *Paglie* class overlaps
-  the dusty *Good* samples on the structural (LBP/GLCM) features.
-* **Significance testing** — one-way ANOVA and the non-parametric Kruskal-Wallis
-  test on the structural features between ``Good`` and ``Rotture`` / ``Nodi``,
-  with a companion effect-size estimate.
+* **PCA** — standardised features, explained variance of every fitted component
+  (scree plot), sample scores and loadings. The loadings tell *which* features
+  drive each component; their squared values, summed per feature family
+  (colour / GLCM / LBP), tell whether a component is mostly about colour or
+  about texture.
+* **t-SNE** — a 2D embedding for visual inspection, plus a stability check over
+  several perplexities and seeds. Distances between clusters and cluster sizes
+  in a t-SNE map are not interpretable; only structures that appear in every
+  run of the stability grid should be described.
+* **Sample counts** per fabric and class, reported next to every figure.
 
-Only ``numpy``, ``pandas``, ``scipy`` and ``scikit-learn`` are used.
+The analysis is purely descriptive: no hypothesis test is run here.
+
+Only ``numpy``, ``pandas`` and ``scikit-learn`` are used.
 """
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 
 # Metadata columns that are never treated as features.
-_META_COLS = ("filename", "label", "group")
+META_COLS = ("filename", "fabric", "label", "group")
+
+# Feature families, identified by column-name prefix.
+FEATURE_FAMILIES: Dict[str, Tuple[str, ...]] = {
+    "colour": ("hsv_", "lab_"),
+    "glcm": ("glcm_",),
+    "lbp": ("lbp_",),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -46,294 +57,269 @@ def get_feature_columns(df: pd.DataFrame, prefixes: Sequence[str] | None = None)
         Feature matrix including the metadata columns.
     prefixes : sequence of str, optional
         If given, keep only columns whose name starts with one of these
-        prefixes (e.g. ``("glcm_", "lbp_")`` to select structural features).
+        prefixes (e.g. ``("glcm_", "lbp_")`` to select texture features).
     """
     cols = [
         c for c in df.columns
-        if c not in _META_COLS and pd.api.types.is_numeric_dtype(df[c])
+        if c not in META_COLS and pd.api.types.is_numeric_dtype(df[c])
     ]
     if prefixes is not None:
         cols = [c for c in cols if any(c.startswith(p) for p in prefixes)]
     return cols
 
 
-def structural_feature_columns(df: pd.DataFrame) -> List[str]:
-    """Convenience selector for GLCM + LBP (i.e. texture/structural) columns."""
-    return get_feature_columns(df, prefixes=("glcm_", "lbp_"))
+def feature_family(col: str) -> str:
+    """Return the family (``colour``/``glcm``/``lbp``/``other``) of a feature."""
+    for family, prefixes in FEATURE_FAMILIES.items():
+        if any(col.startswith(p) for p in prefixes):
+            return family
+    return "other"
+
+
+def usable_feature_columns(df: pd.DataFrame, cols: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Split ``cols`` into features with variance and constant features.
+
+    A feature that is constant within the analysed subset carries no
+    information and would only produce a zero loading, so it is excluded
+    from that analysis (and reported).
+    """
+    std = df[list(cols)].std(ddof=0)
+    kept = [c for c in cols if std[c] > 1e-12]
+    dropped = [c for c in cols if std[c] <= 1e-12]
+    return kept, dropped
+
+
+def _standardised_matrix(df: pd.DataFrame, cols: Sequence[str]) -> np.ndarray:
+    """Z-score the features (mean 0, std 1) over the analysed subset.
+
+    Standardisation is mandatory before PCA and t-SNE because the raw features
+    live on very different scales (colour variances in the hundreds, LBP
+    histogram bins in [0, 1]).
+    """
+    X = df[list(cols)].to_numpy(dtype=np.float64)
+    if not np.isfinite(X).all():
+        bad = [c for c in cols if not np.isfinite(df[c]).all()]
+        raise ValueError(f"Non-finite values in features: {bad}")
+    return StandardScaler().fit_transform(X)
 
 
 # --------------------------------------------------------------------------- #
-# Dimensionality reduction
+# PCA
 # --------------------------------------------------------------------------- #
+@dataclass
+class PCAResult:
+    """Everything the figures and tables of a PCA need.
+
+    Attributes
+    ----------
+    scores : DataFrame
+        One row per sample (same index as the input), columns ``PC1..PCk``.
+    explained_variance_ratio : ndarray
+        Fraction of total variance explained by each fitted component.
+    loadings : DataFrame
+        Features x components. Each column is a unit vector: the squared
+        loadings of a component sum to 1.
+    feature_cols : list of str
+        Features actually used (constant ones removed).
+    dropped_constant : list of str
+        Features removed because constant in the analysed subset.
+    """
+
+    scores: pd.DataFrame
+    explained_variance_ratio: np.ndarray
+    loadings: pd.DataFrame
+    feature_cols: List[str]
+    dropped_constant: List[str] = field(default_factory=list)
+
+    def explained_variance_table(self) -> pd.DataFrame:
+        """Per-component and cumulative explained variance, in percent."""
+        evr = self.explained_variance_ratio
+        return pd.DataFrame(
+            {
+                "component": [f"PC{i + 1}" for i in range(len(evr))],
+                "explained_variance_pct": np.round(evr * 100, 2),
+                "cumulative_pct": np.round(np.cumsum(evr) * 100, 2),
+            }
+        )
+
+
 def run_pca(
     df: pd.DataFrame,
-    feature_cols: List[str] | None = None,
-    n_components: int = 2,
+    feature_cols: Sequence[str],
+    n_components: int = 10,
     random_state: int = 42,
-) -> pd.DataFrame:
-    """Project the samples with PCA and append ``pca_1..pca_n`` columns.
+) -> PCAResult:
+    """Fit a PCA on the standardised features of ``df``.
 
-    PCA diagonalises the covariance matrix of the *standardised* features and
-    keeps the ``n_components`` directions of largest variance. Standardisation is
-    mandatory here because the raw features live on wildly different scales
-    (e.g. colour variance in the hundreds vs. LBP histogram bins in [0, 1]).
-
-    The per-component explained-variance ratio is stored on
-    ``df.attrs["pca_explained_variance_ratio_"]`` for later annotation of plots.
+    The number of components is capped by ``n_samples - 1`` and by the number
+    of non-constant features. Component signs are arbitrary (a PCA is defined
+    up to a sign flip per component): only relative positions matter.
     """
-    if feature_cols is None:
-        feature_cols = get_feature_columns(df)
+    cols, dropped = usable_feature_columns(df, feature_cols)
+    X = _standardised_matrix(df, cols)
 
-    X = StandardScaler().fit_transform(df[feature_cols].to_numpy())
-    pca = PCA(n_components=n_components, random_state=random_state)
-    proj = pca.fit_transform(X)
+    k = int(min(n_components, X.shape[0] - 1, X.shape[1]))
+    if k < 1:
+        raise ValueError(f"PCA needs at least 2 samples, got {X.shape[0]}.")
 
-    out = df.copy()
-    for i in range(n_components):
-        out[f"pca_{i + 1}"] = proj[:, i]
-    out.attrs["pca_explained_variance_ratio_"] = pca.explained_variance_ratio_
-    return out
+    pca = PCA(n_components=k, random_state=random_state)
+    scores = pca.fit_transform(X)
+    pcs = [f"PC{i + 1}" for i in range(k)]
+
+    return PCAResult(
+        scores=pd.DataFrame(scores, index=df.index, columns=pcs),
+        explained_variance_ratio=pca.explained_variance_ratio_,
+        loadings=pd.DataFrame(pca.components_.T, index=cols, columns=pcs),
+        feature_cols=cols,
+        dropped_constant=dropped,
+    )
+
+
+def top_loadings(result: PCAResult, component: str, top_k: int = 8) -> pd.DataFrame:
+    """Features with the largest absolute loading on ``component``."""
+    col = result.loadings[component]
+    order = col.abs().sort_values(ascending=False).index[:top_k]
+    return pd.DataFrame(
+        {
+            "feature": order,
+            "family": [feature_family(f) for f in order],
+            "loading": col[order].to_numpy(),
+        }
+    )
+
+
+def family_share(result: PCAResult, components: Sequence[str]) -> pd.DataFrame:
+    """Share of each component due to each feature family.
+
+    Because every component is a unit vector, its squared loadings sum to 1;
+    summing them per family gives the fraction of the component built from
+    colour, GLCM or LBP features. The number of features per family is
+    reported too: a family with many features (the 26 LBP bins) can obtain a
+    large share partly because of its size, so the share per feature is given
+    as well.
+    """
+    families = pd.Series({f: feature_family(f) for f in result.feature_cols})
+    n_per_family = families.value_counts()
+    rows = []
+    for comp in components:
+        if comp not in result.loadings.columns:
+            continue
+        sq = result.loadings[comp] ** 2
+        share = sq.groupby(families).sum()
+        for family, value in share.items():
+            rows.append(
+                {
+                    "component": comp,
+                    "family": family,
+                    "n_features": int(n_per_family[family]),
+                    "share_pct": round(float(value) * 100, 2),
+                    "share_per_feature_pct": round(float(value) * 100 / n_per_family[family], 3),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# t-SNE
+# --------------------------------------------------------------------------- #
+def resolve_perplexity(perplexity: float, n_samples: int) -> float:
+    """Clip the perplexity to a value valid for ``n_samples``.
+
+    scikit-learn requires ``perplexity < n_samples``; a common rule of thumb
+    keeps it below roughly a third of the sample size.
+    """
+    upper = max(2.0, (n_samples - 1) / 3.0)
+    return float(min(perplexity, upper))
 
 
 def run_tsne(
     df: pd.DataFrame,
-    feature_cols: List[str] | None = None,
-    n_components: int = 2,
-    perplexity: float | None = None,
-    pre_pca_dims: int = 30,
+    feature_cols: Sequence[str],
+    perplexity: float = 30.0,
     random_state: int = 42,
-) -> pd.DataFrame:
-    """Project the samples with t-SNE and append ``tsne_1..tsne_n`` columns.
+    pre_pca_dims: int = 30,
+    init: str = "pca",
+) -> Tuple[np.ndarray, float]:
+    """Return a 2D t-SNE embedding of the standardised features.
 
-    t-SNE models pairwise similarities as conditional probabilities in the
-    high-dimensional space (Gaussian kernel) and in the embedding (heavy-tailed
-    Student-t kernel), then minimises the Kullback-Leibler divergence between the
-    two. It excels at revealing *local* cluster structure and non-linear class
-    overlap.
+    A preliminary PCA to ``pre_pca_dims`` components removes noise and speeds up
+    the neighbour search, as recommended in the t-SNE literature.
 
-    A preliminary PCA to ``pre_pca_dims`` denoises the input and speeds up the
-    neighbour search, as recommended by the original authors. ``perplexity``
-    defaults to a data-dependent value bounded to a sensible range.
+    ``init="pca"`` (default, used for the figure in the chapter) starts from the
+    PCA layout, which preserves the global arrangement better and makes the
+    result essentially independent of the seed. ``init="random"`` is used by
+    :func:`tsne_stability`: only with a random start does the seed actually
+    change the optimisation, which is what a stability check needs.
+
+    Returns
+    -------
+    embedding : ndarray of shape (n_samples, 2)
+    perplexity : float
+        The perplexity actually used (after clipping).
     """
-    if feature_cols is None:
-        feature_cols = get_feature_columns(df)
+    cols, _ = usable_feature_columns(df, feature_cols)
+    X = _standardised_matrix(df, cols)
 
-    X = StandardScaler().fit_transform(df[feature_cols].to_numpy())
-
-    # Denoise / compress before the manifold step (never request more components
-    # than available samples or features).
     n_pre = min(pre_pca_dims, X.shape[1], max(1, X.shape[0] - 1))
     X = PCA(n_components=n_pre, random_state=random_state).fit_transform(X)
 
-    n_samples = X.shape[0]
-    if perplexity is None:
-        # Rule of thumb: perplexity < n_samples; keep it in [5, 50].
-        perplexity = float(np.clip(n_samples / 3.0, 5.0, 50.0))
-    perplexity = min(perplexity, max(2.0, (n_samples - 1) / 3.0))
-
+    perp = resolve_perplexity(perplexity, X.shape[0])
     tsne = TSNE(
-        n_components=n_components,
-        perplexity=perplexity,
-        init="pca",
+        n_components=2,
+        perplexity=perp,
+        init=init,
         learning_rate="auto",
         random_state=random_state,
     )
-    proj = tsne.fit_transform(X)
-
-    out = df.copy()
-    for i in range(n_components):
-        out[f"tsne_{i + 1}"] = proj[:, i]
-    out.attrs["tsne_perplexity_"] = perplexity
-    return out
+    return tsne.fit_transform(X), perp
 
 
-# --------------------------------------------------------------------------- #
-# Distribution-overlap metrics
-# --------------------------------------------------------------------------- #
-def _histogram_pair(a: np.ndarray, b: np.ndarray, bins: int = 50):
-    """Bin two samples on a shared support and return normalised histograms."""
-    lo = float(min(a.min(), b.min()))
-    hi = float(max(a.max(), b.max()))
-    if hi - lo < 1e-12:  # degenerate: both distributions are a single point
-        return None, None
-    edges = np.linspace(lo, hi, bins + 1)
-    pa, _ = np.histogram(a, bins=edges, density=True)
-    pb, _ = np.histogram(b, bins=edges, density=True)
-    width = edges[1] - edges[0]
-    # Convert densities into probability masses (sum to 1).
-    pa = pa * width
-    pb = pb * width
-    return pa, pb
-
-
-def bhattacharyya_coefficient(a: np.ndarray, b: np.ndarray, bins: int = 50) -> float:
-    """Bhattacharyya coefficient ``BC = sum_i sqrt(p_i q_i)`` in ``[0, 1]``.
-
-    ``BC = 1`` means the two empirical distributions are identical, ``BC = 0``
-    means disjoint support. It is the discrete estimate of
-    :math:`\\int \\sqrt{p(x)q(x)}\\,dx`.
-    """
-    pa, pb = _histogram_pair(a, b, bins)
-    if pa is None:
-        return 1.0
-    return float(np.sum(np.sqrt(pa * pb)))
-
-
-def overlapping_coefficient(a: np.ndarray, b: np.ndarray, bins: int = 50) -> float:
-    """Overlapping Coefficient ``OVL = sum_i min(p_i, q_i)`` in ``[0, 1]``.
-
-    OVL is the area shared by the two probability distributions — an intuitive,
-    directly interpretable measure of ambiguity between two classes.
-    """
-    pa, pb = _histogram_pair(a, b, bins)
-    if pa is None:
-        return 1.0
-    return float(np.sum(np.minimum(pa, pb)))
-
-
-def overlap_metrics(
+def tsne_stability(
     df: pd.DataFrame,
-    class_a: str,
-    class_b: str,
-    feature_cols: List[str] | None = None,
-    bins: int = 50,
-) -> pd.DataFrame:
-    """Per-feature distribution overlap between two classes.
+    feature_cols: Sequence[str],
+    perplexities: Sequence[float],
+    seeds: Sequence[int],
+    pre_pca_dims: int = 30,
+) -> Dict[Tuple[float, int], np.ndarray]:
+    """Recompute the t-SNE for every (perplexity, seed) pair.
 
-    Used to quantify the visual ambiguity between ``Paglie`` and the dusty
-    ``Good`` samples on the structural features. For each feature it reports the
-    Bhattacharyya coefficient/distance and the overlapping coefficient.
-
-    Parameters
-    ----------
-    class_a, class_b : str
-        Labels (values of the ``label`` column) to compare.
-    feature_cols : list of str, optional
-        Defaults to the structural (GLCM + LBP) features.
+    Every run starts from a RANDOM initialisation (with a PCA start the seed
+    would have no effect and all runs would be identical). Perplexities that
+    collapse to the same value after clipping are computed once. The returned
+    dict is keyed by ``(effective_perplexity, seed)``.
     """
-    if feature_cols is None:
-        feature_cols = structural_feature_columns(df)
-
-    sa = df.loc[df["label"] == class_a]
-    sb = df.loc[df["label"] == class_b]
-    if sa.empty or sb.empty:
-        raise ValueError(
-            f"Cannot compute overlap: '{class_a}' has {len(sa)} samples, "
-            f"'{class_b}' has {len(sb)}."
-        )
-
-    records = []
-    for col in feature_cols:
-        a = sa[col].to_numpy()
-        b = sb[col].to_numpy()
-        bc = bhattacharyya_coefficient(a, b, bins)
-        ovl = overlapping_coefficient(a, b, bins)
-        records.append(
-            {
-                "feature": col,
-                "bhattacharyya_coeff": bc,
-                # Distance = -ln(BC); +inf when disjoint. 0 when identical.
-                "bhattacharyya_dist": float(-np.log(bc)) if bc > 0 else np.inf,
-                "overlap_coeff": ovl,
-            }
-        )
-    # Rank by ambiguity: the most-overlapping features first.
-    return (
-        pd.DataFrame(records)
-        .sort_values("overlap_coeff", ascending=False)
-        .reset_index(drop=True)
-    )
+    n = len(df)
+    effective = sorted({resolve_perplexity(p, n) for p in perplexities})
+    runs: Dict[Tuple[float, int], np.ndarray] = {}
+    for perp in effective:
+        for seed in seeds:
+            emb, _ = run_tsne(df, feature_cols, perplexity=perp, random_state=int(seed),
+                              pre_pca_dims=pre_pca_dims, init="random")
+            runs[(perp, int(seed))] = emb
+    return runs
 
 
 # --------------------------------------------------------------------------- #
-# Significance testing
+# Sample counts
 # --------------------------------------------------------------------------- #
-def _epsilon_squared_kw(h_stat: float, n_total: int, k_groups: int) -> float:
-    """Epsilon-squared effect size for Kruskal-Wallis.
-
-    :math:`\\epsilon^2 = (H - k + 1) / (n - k)`, bounded to ``[0, 1]``.
-    """
-    denom = n_total - k_groups
-    if denom <= 0:
-        return float("nan")
-    return float(max(0.0, (h_stat - k_groups + 1) / denom))
+def ordered_levels(present: Sequence[str], preferred: Sequence[str] | None = None) -> List[str]:
+    """Levels in the preferred order first, then any remaining ones alphabetically."""
+    present = list(dict.fromkeys(present))
+    preferred = list(preferred or [])
+    head = [x for x in preferred if x in present]
+    tail = sorted(x for x in present if x not in head)
+    return head + tail
 
 
-def _eta_squared_anova(groups: Sequence[np.ndarray]) -> float:
-    """Eta-squared effect size for one-way ANOVA (between-group variance share)."""
-    all_vals = np.concatenate(groups)
-    grand_mean = all_vals.mean()
-    ss_total = np.sum((all_vals - grand_mean) ** 2)
-    ss_between = sum(len(g) * (g.mean() - grand_mean) ** 2 for g in groups)
-    if ss_total < 1e-12:
-        return float("nan")
-    return float(ss_between / ss_total)
-
-
-def significance_tests(
+def class_counts(
     df: pd.DataFrame,
-    reference: str = "Good",
-    targets: Sequence[str] = ("Rotture", "Nodi"),
-    feature_cols: List[str] | None = None,
+    fabric_order: Sequence[str] | None = None,
+    class_order: Sequence[str] | None = None,
 ) -> pd.DataFrame:
-    """Test whether each structural feature separates ``reference`` from ``targets``.
-
-    For every ``(target, feature)`` pair the reference class is compared against
-    the target class with:
-
-    * **One-way ANOVA** (:func:`scipy.stats.f_oneway`) — parametric test on the
-      equality of the two group means; sensitive but assumes normality and equal
-      variance.
-    * **Kruskal-Wallis** (:func:`scipy.stats.kruskal`) — non-parametric rank test
-      on the equality of distributions; robust to the non-Gaussian, heavy-tailed
-      nature of texture features.
-
-    Effect sizes (eta^2 for ANOVA, epsilon^2 for Kruskal-Wallis) accompany the
-    p-values so that statistical significance is not confused with practical
-    magnitude.
-
-    Returns a tidy DataFrame sorted by the Kruskal-Wallis p-value.
-    """
-    if feature_cols is None:
-        feature_cols = structural_feature_columns(df)
-
-    ref = df.loc[df["label"] == reference]
-    if ref.empty:
-        raise ValueError(f"Reference class '{reference}' has no samples.")
-
-    records = []
-    for target in targets:
-        tgt = df.loc[df["label"] == target]
-        if tgt.empty:
-            print(f"Warning: target class '{target}' not present; skipping.")
-            continue
-
-        for col in feature_cols:
-            a = ref[col].to_numpy()
-            b = tgt[col].to_numpy()
-
-            # Constant-across-both features break the tests; report NaN cleanly.
-            if np.ptp(np.concatenate([a, b])) < 1e-12:
-                f_stat = f_p = h_stat = h_p = np.nan
-                eta2 = eps2 = np.nan
-            else:
-                f_stat, f_p = stats.f_oneway(a, b)
-                h_stat, h_p = stats.kruskal(a, b)
-                eta2 = _eta_squared_anova([a, b])
-                eps2 = _epsilon_squared_kw(h_stat, len(a) + len(b), 2)
-
-            records.append(
-                {
-                    "comparison": f"{reference} vs {target}",
-                    "feature": col,
-                    "anova_F": f_stat,
-                    "anova_p": f_p,
-                    "anova_eta2": eta2,
-                    "kruskal_H": h_stat,
-                    "kruskal_p": h_p,
-                    "kruskal_eps2": eps2,
-                }
-            )
-
-    result = pd.DataFrame(records)
-    return result.sort_values(["comparison", "kruskal_p"]).reset_index(drop=True)
+    """Number of samples per fabric (rows) and class (columns), with totals."""
+    table = pd.crosstab(df["fabric"], df["label"])
+    table = table.reindex(ordered_levels(table.index, fabric_order))
+    table = table[ordered_levels(table.columns, class_order)]
+    table["Totale"] = table.sum(axis=1)
+    table.loc["Totale"] = table.sum(axis=0)
+    return table
