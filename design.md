@@ -52,12 +52,12 @@ quindi sottoinsiemi l'una dell'altra: per ogni split, V1 = V0 − R1 + D1 e
 V2 = V0 − R2 + D2, dove R sono i `good` rimossi e D le immagini con polvere
 aggiunte.
 
-Ipotesi di lavoro, le uniche differenze tra
+**[DA CONFERMARE]** Ipotesi di lavoro, da verificare (§3): le uniche differenze tra
 le versioni sono i `good` rimossi (R) e le immagini con polvere aggiunte (D), tutte
 in `good`; difetti e maschere sono identici; il train di V1 è identico a quello
 di V0.
 
-La polvere si identifica senza annotazione manuale: sono le
+Se l'ipotesi regge, la polvere si identifica senza annotazione manuale: sono le
 immagini presenti in una versione con polvere e assenti in V0 **nello stesso
 split**. Il confronto è **per contenuto** (hash dei pixel), non per nome, perché i
 nomi potrebbero essere cambiati tra le versioni. Se l'ipotesi non regge, serve un
@@ -68,7 +68,7 @@ Le analisi che coinvolgono la polvere si fanno **solo sul nero**; per gli altri
 tessuti si analizza V0, senza affermazioni sulla polvere. Le classi di difetto
 cambiano da tessuto a tessuto, quindi i tessuti restano dataset separati.
 
-Numero di immagini con polvere nel nero, per split e per
+**[DA CONFERMARE]** Numero di immagini con polvere nel nero, per split e per
 versione (decide se un confronto è quantitativo o solo descrittivo, §5), e se la
 polvere del test è la stessa in V1 e V2.
 
@@ -103,7 +103,9 @@ Sei gruppi, usati in tutto il documento. `dust` viene dal confronto tra versioni
 | `test_dust` | `test/good` con polvere | negativi con polvere |
 | `test_def` | `test/<difetto>` | positivi della valutazione |
 
-Le maschere hanno lo stesso stem delle immagini originali.
+**[DA CONFERMARE]** nome e formato delle maschere (stesso stem dell'immagine?
+suffisso? file vuoti per `good` o cartella assente?) e la classe di difetto che
+somiglia di più alla polvere in ogni tessuto (serve alla galleria, §4.5).
 
 ## 3. Controlli di integrità (prima di ogni analisi)
 
