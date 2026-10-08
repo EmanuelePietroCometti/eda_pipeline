@@ -1,88 +1,72 @@
 """
-masks.py  (analisi 1)
-=====================
+masks.py
+========
 
-Statistiche dei difetti dalle maschere: componenti connesse, area in pixel e in
-% della patch, bounding box, e confronto con la dimensione delle celle dei backbone.
+Numerosità per versione e gruppo, con l'area mediana dei difetti presa dalle maschere.
+
+L'unità dell'area è la componente connessa della maschera (un "difetto"). Per ogni versione e
+gruppo (`train_good`, `train_dust`, `train_def`, `test_good`, `test_dust`, `test_def`) la tabella
+riporta il numero di immagini; per i difetti anche il numero di componenti e l'area mediana, sia
+per tutte le classi insieme (``ALL``) sia per classe. Buoni e polvere non hanno maschera: area vuota.
 """
 
 import cv2
 import numpy as np
 import pandas as pd
-import seaborn as sns
-from matplotlib import pyplot as plt
 from skimage.measure import label, regionprops
 
-from .utils import save_fig
+GROUP_ORDER = ["train_good", "train_dust", "train_def", "test_good", "test_dust", "test_def"]
+COMP_COLUMNS = ["filename", "group", "label", "component", "area_px", "area_pct"]
 
 
 def component_table(idx: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """Una riga per componente connessa di ogni maschera non vuota."""
     thr = cfg["masks"]["threshold"]
     conn = cfg["masks"]["connectivity"]
-    model = cfg["general"]["model_input_size"]
     rows = []
     for r in idx[idx["has_mask"]].itertuples(index=False):
         mask = cv2.imread(r.mask_path, cv2.IMREAD_GRAYSCALE) > thr
         h, w = mask.shape
         for k, p in enumerate(regionprops(label(mask, connectivity=conn)), start=1):
-            y0, x0, y1, x1 = p.bbox
-            rows.append({
-                "filename": r.filename, "split": r.split, "label": r.label, "component": k,
-                "area_px": int(p.area),
-                "area_pct": 100 * p.area / (h * w),
-                # i modelli vedono 256 px, le maschere sono a 512: si riscala l'area
-                "area_model_px": p.area * (model / h) * (model / w),
-                "bbox_h": y1 - y0, "bbox_w": x1 - x0, "extent": float(p.extent),
-            })
-    return pd.DataFrame(rows)
+            rows.append({"filename": r.filename, "group": r.group, "label": r.label, "component": k,
+                         "area_px": int(p.area), "area_pct": 100 * p.area / (h * w)})
+    return pd.DataFrame(rows, columns=COMP_COLUMNS)
 
 
-def summarize(comps: pd.DataFrame, cell_sizes) -> pd.DataFrame:
-    """Per split e classe: numerosità, area (mediana e quartili) e frazione sotto una cella."""
-    g = comps.groupby(["split", "label"])
-    out = g.agg(n_images=("filename", "nunique"), n_components=("area_px", "size"),
-                area_px_median=("area_px", "median"),
-                area_px_q25=("area_px", lambda s: s.quantile(0.25)),
-                area_px_q75=("area_px", lambda s: s.quantile(0.75)),
-                area_pct_median=("area_pct", "median")).reset_index()
-    for c in cell_sizes:
-        # una cella di stride c copre c*c pixel a risoluzione del modello
-        frac = g["area_model_px"].apply(lambda s, c=c: (s < c * c).mean()).rename(f"frac_below_{c}px_cell")
-        out = out.merge(frac.reset_index(), on=["split", "label"])
-    return out
+def count_table(idx_by_version: dict, cfg: dict) -> pd.DataFrame:
+    """Numerosità per versione, gruppo e classe, con l'area mediana dei difetti.
+
+    `class` è ``-`` per buoni e polvere, ``ALL`` per tutti i difetti del gruppo, altrimenti il
+    nome della cartella di difetto.
+    """
+    parts = []
+    for v, idx in idx_by_version.items():
+        imgs = pd.concat([idx.assign(cls=np.where(idx["is_defect"], "ALL", "-")),
+                          idx[idx["is_defect"]].assign(cls=lambda d: d["label"])])
+        n = imgs.groupby(["group", "cls"]).size().rename("n_images")
+        comps = component_table(idx, cfg)
+        comps = pd.concat([comps.assign(cls="ALL"), comps.assign(cls=comps["label"])])
+        area = comps.groupby(["group", "cls"]).agg(
+            n_defects=("area_px", "size"), area_px_median=("area_px", "median"),
+            area_pct_median=("area_pct", "median"))
+        t = n.to_frame().join(area).reset_index()
+        t["n_defects"] = t["n_defects"].astype("Int64")
+        t.insert(0, "version", v)
+        parts.append(t)
+    out = pd.concat(parts, ignore_index=True).rename(columns={"cls": "class"})
+    # ordine di lettura: per versione, i gruppi come in GROUP_ORDER, ALL prima delle singole classi
+    out["_g"] = out["group"].map(GROUP_ORDER.index)
+    out["_c"] = (~out["class"].isin(["-", "ALL"])).astype(int)
+    return out.sort_values(["_g", "_c", "class", "version"]).drop(columns=["_g", "_c"]).reset_index(drop=True)
 
 
-def plot_area_ecdf(comps: pd.DataFrame, cell_sizes, path):
-    g = sns.displot(data=comps, x="area_model_px", hue="label", col="split", kind="ecdf",
-                    log_scale=True, height=3.6, aspect=1.2, facet_kws={"sharey": True})
-    for ax in g.axes.ravel():
-        for c in cell_sizes:
-            ax.axvline(c * c, color="grey", ls="--", lw=0.8)
-        ax.set_xlabel("Area della componente a 256 px [px, scala log]")
-    g.set_ylabels("Frazione di componenti")
-    return save_fig(g.figure, path)
-
-
-def plot_area_pct(comps: pd.DataFrame, path):
-    fig, ax = plt.subplots(figsize=(6, 0.7 * comps["label"].nunique() + 2))
-    sns.boxplot(data=comps, x="area_pct", y="label", hue="split", ax=ax, fliersize=2)
-    ax.set_xscale("log")
-    ax.set_xlabel("Area della componente [% della patch, scala log]")
-    ax.set_ylabel("")
-    return save_fig(fig, path)
-
-
-def run(idx: pd.DataFrame, cfg: dict, out_dir):
-    comps = component_table(idx, cfg)
-    comps.to_csv(f"{out_dir}/mask_components.csv", index=False)
-    if comps.empty:
-        print("[maschere] nessuna componente trovata")
-        return comps
-    cells = cfg["masks"]["cell_sizes_px"]
-    summary = summarize(comps, cells)
-    summary.to_csv(f"{out_dir}/mask_summary.csv", index=False)
-    plot_area_ecdf(comps, cells, f"{out_dir}/figures/mask_area_ecdf.png")
-    plot_area_pct(comps, f"{out_dir}/figures/mask_area_pct.png")
-    print(summary.round(3).to_string(index=False))
-    return comps
+def run(idx_by_version: dict, cfg: dict, out):
+    tab = count_table(idx_by_version, cfg)
+    tab.to_csv(out / "counts.csv", index=False)
+    wide = tab.pivot(index=["group", "class"], columns="version", values=["n_images", "area_px_median"])
+    wide = wide.reindex(tab[["group", "class"]].drop_duplicates().itertuples(index=False, name=None))
+    wide.to_csv(out / "counts_wide.csv")
+    show = pd.concat({"n_images": wide["n_images"].fillna(0).astype(int),
+                      "area_px_median": wide["area_px_median"].round(1).astype("object").fillna("")}, axis=1)
+    print("Numerosità per gruppo e versione, area mediana del difetto [px della patch]:\n" + show.to_string())
+    return tab

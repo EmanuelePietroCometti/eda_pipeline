@@ -3,7 +3,7 @@ dataset.py
 ==========
 
 Indice del dataset (una riga per immagine), identificazione della polvere per
-differenza tra versioni e controlli di coerenza (design.md, sezioni 2 e 3).
+differenza tra versioni e gruppi (vedi README).
 
 Layout atteso di ogni versione::
 
@@ -13,7 +13,6 @@ Layout atteso di ogni versione::
 """
 
 import hashlib
-from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -33,7 +32,7 @@ def build_index(root, cfg) -> pd.DataFrame:
     non None. Per questo la colonna ``mask_path`` usa la stringa vuota ""
     e ``has_mask`` è un booleano: nessun ``is None`` da controllare.
     """
-    root = Path(root)
+    root = Path(str(root).replace("\\", "/"))   # i percorsi del config possono avere i backslash di Windows
     dcfg = cfg["dataset"]
     exts = {e.lower() for e in dcfg["extensions"]}
     suffix = dcfg.get("mask_suffix", "")
@@ -91,7 +90,7 @@ def identify_dust(idx_ref: pd.DataFrame, idx: pd.DataFrame) -> pd.DataFrame:
 
 
 def assign_groups(idx: pd.DataFrame) -> pd.DataFrame:
-    """Aggiunge la colonna `group` con i sei gruppi di design.md."""
+    """Aggiunge la colonna `group` con i sei gruppi del README."""
     out = idx.copy()
     out["group"] = np.select(
         [out["is_defect"], out["dust"]],
@@ -99,94 +98,3 @@ def assign_groups(idx: pd.DataFrame) -> pd.DataFrame:
         default=out["split"] + "_good",
     )
     return out
-
-
-# --------------------------------------------------------------------- controlli
-
-def find_duplicates(idx: pd.DataFrame) -> pd.DataFrame:
-    """Immagini con pixel identici dentro una versione (una riga per contenuto ripetuto).
-
-    Un duplicato esatto a cavallo di train e test è leakage nella forma più semplice; un
-    duplicato dentro `train/good` fa avere distanza 0 al leave-one-out del kNN.
-    """
-    d = idx[idx.duplicated("sha", keep=False)]
-    rows = []
-    for sha, g in d.groupby("sha"):
-        rows.append({"sha": sha, "n_copie": len(g), "splits": "+".join(sorted(set(g["split"]))),
-                     "gruppi": "+".join(sorted(set(g["group"]))), "cartelle": "+".join(sorted(set(g["label"]))),
-                     "file": " | ".join(Path(f).name for f in g["filename"])})
-    return pd.DataFrame(rows, columns=["sha", "n_copie", "splits", "gruppi", "cartelle", "file"])
-
-
-def check_masks(idx: pd.DataFrame, threshold: int = 127) -> pd.DataFrame:
-    """Controlli di integrità sulle maschere di una versione. Ritorna i problemi trovati."""
-    issues = []
-    for r in idx.itertuples(index=False):
-        if r.is_defect and not r.has_mask:
-            issues.append((r.filename, "difetto senza maschera"))
-            continue
-        if not r.has_mask:
-            continue
-        m = cv2.imread(r.mask_path, cv2.IMREAD_GRAYSCALE)
-        if m.shape != (r.height, r.width):
-            issues.append((r.filename, f"maschera {m.shape} diversa dall'immagine"))
-        empty = not (m > threshold).any()
-        if r.is_defect and empty:
-            issues.append((r.filename, "maschera di difetto vuota"))
-        if not r.is_defect and not empty:
-            issues.append((r.filename, "maschera di good non vuota (etichetta sbagliata?)"))
-    return pd.DataFrame(issues, columns=["filename", "problema"])
-
-
-def compare_versions(idx_ref: pd.DataFrame, idx: pd.DataFrame, dust_in_train: bool) -> pd.DataFrame:
-    """Controlli di coerenza tra la versione di riferimento (V0) e un'altra (design.md, sez. 3).
-
-    Ritorna una tabella (controllo, ok, dettaglio). Un controllo fallito non si
-    corregge in silenzio: si guarda cosa non torna.
-    """
-    checks = []
-
-    def add(name, ok, detail=""):
-        checks.append({"controllo": name, "ok": bool(ok), "dettaglio": detail})
-
-    # 1. numerosità per split e tipo (good/difetto) uguale
-    c0 = idx_ref.groupby(["split", "is_defect"]).size()
-    c1 = idx.groupby(["split", "is_defect"]).size()
-    add("numerosità per split e tipo uguale", c0.equals(c1), f"V0={c0.to_dict()} altra={c1.to_dict()}")
-
-    key0 = set(zip(idx_ref["split"], idx_ref["sha"]))
-    key1 = set(zip(idx["split"], idx["sha"]))
-    removed = idx_ref[[(s, h) not in key1 for s, h in zip(idx_ref["split"], idx_ref["sha"])]]
-    added = idx[[(s, h) not in key0 for s, h in zip(idx["split"], idx["sha"])]]
-
-    # 2. le immagini rimosse e quelle aggiunte sono solo good
-    add("rimosse rispetto a V0: solo good", not removed["is_defect"].any(), f"{len(removed)} rimosse")
-    add("aggiunte rispetto a V0: solo good", not added["is_defect"].any(), f"{len(added)} aggiunte")
-
-    # 3. per split, rimosse = aggiunte. Il confronto è tra MULTINSIEMI di (split, hash): se il
-    #    dataset contiene immagini con pixel identici (duplicati), un confronto tra insiemi
-    #    conta le righe in modo asimmetrico e il controllo fallirebbe senza che manchi nulla.
-    m0, m1 = Counter(zip(idx_ref["split"], idx_ref["sha"])), Counter(zip(idx["split"], idx["sha"]))
-    rem, add_ = m0 - m1, m1 - m0
-    nr = Counter(s for (s, _), n in rem.items() for _ in range(n))
-    na = Counter(s for (s, _), n in add_.items() for _ in range(n))
-    add("per split: n. rimosse = n. aggiunte (contando i duplicati)", all(nr[s] == na[s] for s in ("train", "test")),
-        f"rimosse={dict(nr)} aggiunte={dict(na)}")
-
-    # 4. se la polvere non è nel train, il train è identico a V0
-    if not dust_in_train:
-        t0 = set(idx_ref.loc[idx_ref["split"] == "train", "sha"])
-        t1 = set(idx.loc[idx["split"] == "train", "sha"])
-        add("train identico a V0 (polvere non nel train)", t0 == t1)
-
-    # 5. difetti e maschere identici tra le versioni
-    d0 = set(zip(idx_ref.loc[idx_ref["is_defect"], "split"], idx_ref.loc[idx_ref["is_defect"], "label"],
-                 idx_ref.loc[idx_ref["is_defect"], "sha"], idx_ref.loc[idx_ref["is_defect"], "mask_sha"]))
-    d1 = set(zip(idx.loc[idx["is_defect"], "split"], idx.loc[idx["is_defect"], "label"],
-                 idx.loc[idx["is_defect"], "sha"], idx.loc[idx["is_defect"], "mask_sha"]))
-    add("difetti e maschere identici a V0", d0 == d1, f"solo in V0: {len(d0 - d1)}, solo nell'altra: {len(d1 - d0)}")
-
-    # 6. le aggiunte non sono duplicati di immagini di V0 spostate di split
-    moved = added[added["sha"].isin(set(idx_ref["sha"]))]
-    add("nessuna aggiunta è un'immagine di V0 spostata di split", moved.empty, f"{len(moved)} spostate")
-    return pd.DataFrame(checks)

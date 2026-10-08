@@ -1,5 +1,5 @@
 """
-make_synthetic.py: dataset sintetico con la struttura descritta in design.md.
+make_synthetic.py: dataset sintetico con la struttura descritta nel README.
 
 Serve SOLO a provare che il codice funzioni dove la verità è nota; non sostituisce
 il dataset reale. Genera tre versioni (V0, V1, V2) del tessuto "nero":

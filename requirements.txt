@@ -7,6 +7,7 @@ opencv-python
 seaborn
 matplotlib
 pyyaml
-# opzionale, solo per knn.backbone: resnet18
+umap-learn
+# opzionale, solo per embedding.backbone: resnet18
 # torch
 # torchvision

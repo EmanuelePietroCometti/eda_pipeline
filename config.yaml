@@ -1,13 +1,13 @@
-# Configurazione dell'EDA. Da fissare PRIMA di guardare i risultati (vedi design.md).
+# Configurazione dell'EDA (vedi README.md).
 
 dataset:
-  fabric: nero
-  reference_version: V0            # su questa si fanno maschere e confronti tra versioni
+  fabric: quadrettoni
+  reference_version: V0           # versione senza polvere: la polvere delle altre si trova per differenza da questa
   # Cartelle radice delle tre versioni. Ogni radice contiene train/, test/, ground_truth/.
   versions:
-    V0: {path: data\tessuto_quadrettoni, dust_train: false, dust_test: false}
-    #V1: {path: data\tessuto_chiaro_dust_validation, dust_train: false, dust_test: true}
-    #V2: {path: data\tessuto_chiaro_dust_train, dust_train: true,  dust_test: true}
+    V0: {path: D:\emanuele\Code\dataset\tessuto_quadrettoni}
+    #V1: {path: D:\emanuele\Code\dataset\tessuto_nero_dust_validation}
+    #V2: {path: D:\emanuele\Code\dataset\tessuto_nero_dust_train}
   good_folder: good
   extensions: [".png", ".bmp", ".jpg", ".jpeg", ".tif", ".tiff"]
   mask_suffix: ""             # [DA CONFERMARE] suffisso del nome della maschera ("" se assente)
@@ -20,30 +20,13 @@ general:
 
 masks:
   threshold: 127
-  connectivity: 2
-  cell_sizes_px: [8, 16]           # stride di layer2 e layer3 a 256 px
+  connectivity: 2                  # 2 = 8-connettività: una componente connessa è un difetto
 
-leakage:
-  overlap_px: 32
-  min_strip_std: 3.0               # strisce piatte (std sotto soglia) non contano come coppie
-  phash_max_hamming: 4
-  phash_min_corr: 0.98
+embedding:
+  backbone: "resnet18"             # simple | resnet18   [DA CONFERMARE] da fissare in anticipo
 
-domain_shift:
-  n_bootstrap: 1000
-  cv_splits: 5
-  pca_components: 20
-  n_permutations: 50
-  min_n: 20
-
-knn:
-  backbone: "resnet18"               # simple | resnet18   [DA CONFERMARE] da fissare in anticipo
-  k_values: [1, 5]
-  primary_k: 1
-  n_bootstrap: 1000
-
-gallery:
-  defect_class: "paglia"           # [DA CONFERMARE] il difetto più simile alla polvere
-  n_per_class: 12
-  n_cols: 4
-  crop_px: 160
+projection:
+  methods: [pca, tsne, umap]
+  max_per_group: null              # es. 2000: al più 2000 immagini per gruppo e classe
+  tsne: {perplexity: 30}
+  umap: {n_neighbors: 15, min_dist: 0.1}

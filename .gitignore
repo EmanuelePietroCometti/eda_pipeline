@@ -6,3 +6,5 @@ outputs/
 dataset_*/
 dataset/
 results/
+results_old/
+images/
